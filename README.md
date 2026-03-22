@@ -6,10 +6,16 @@ It is based on the [3D thinning algorithm by Lee and Kashyap (1994)](https://doi
 
 ## Features
 
-This implementation provides two operating modes to suit your needs:
+This implementation provides two topologically safe operating modes to suit your needs:
 
-1. **Non-Deterministic (Fastest):** Operates entirely on the GPU in parallel. It is aggressively fast, reaching up to ~190x speedup over standard CPU implementations. However, due to parallel race conditions during connectivity checks, the final skeleton may differ slightly from a strictly sequential CPU run.
-2. **Deterministic (Identical to CPU):** A hybrid CPU-GPU approach. The heavy mathematical filtering (Euler checks) happens in parallel on the GPU, while the connectivity re-checking is safely managed sequentially by the CPU using zero-overhead memory compaction. It produces a 100% pixel-perfect identical result to the standard ITK CPU implementation while still maintaining an ~85x speedup.
+1. **Mode 0: GPU Subgrid 8-Color Parallel (`mode=0`, Default)**
+   * **Speed:** Extremely Fast (~200x speedup over CPU)
+   * **Behavior:** Operates entirely on the GPU. It avoids race conditions by partitioning the image into an 8-color 3D checkerboard. It re-checks and deletes pixels of the same color in parallel because they are mathematically guaranteed not to touch each other.
+   * **Topology:** **Topologically Safe**. Produces a mathematically valid skeleton. *Note: Because the deletion order differs slightly from a strict CPU raster-scan, the exact pixel placement may differ very slightly from ITK (e.g. 0.003% difference), but the overall global topology is preserved perfectly.*
+2. **Mode 1: Hybrid CPU-GPU Sequential (`mode=1`)**
+   * **Speed:** Fast (~80x speedup over CPU)
+   * **Behavior:** Calculates Euler invariance on the GPU in parallel, but performs the final 26-connectivity re-checks strictly sequentially on the CPU (using zero-overhead memory compaction). 
+   * **Topology:** **100% Identical to ITK**. Guaranteed to produce the exact same pixel output as standard sequential CPU implementations like `itk.BinaryThinningImageFilter3D`.
 
 ## Installation
 
@@ -38,16 +44,15 @@ import torch
 from binary_thinning_3d import binary_thinning
 
 # Create or load a 3D binary mask on the GPU
-# Example: 100x100x100 volume
 tensor = torch.zeros((100, 100, 100), dtype=torch.uint8, device='cuda')
 tensor[25:75, 25:75, 25:75] = 1 # Solid block
 
-# 1. Non-Deterministic (Max Speed)
+# 1. GPU Subgrid (Default, Max Speed, Topologically Safe)
 # Modifies the tensor in-place
-binary_thinning(tensor, deterministic=False)
+binary_thinning(tensor, mode=0)
 
-# 2. Deterministic (Exact ITK Match)
-binary_thinning(tensor, deterministic=True)
+# 2. Hybrid CPU-GPU (Exact ITK Match)
+binary_thinning(tensor, mode=1)
 ```
 
 ## Benchmark
@@ -58,12 +63,13 @@ The benchmark compares this CUDA implementation against `itk.BinaryThinningImage
 
 | Method | Output Voxel Count | Time (Seconds) | Speedup vs ITK | Matches ITK CPU? |
 | :--- | :--- | :--- | :--- | :--- |
-| **CUDA (Non-Deterministic)** | 2,441 | **0.71 s** | **196x** | No (Slightly aggressive) |
-| **CUDA (Deterministic)** | 4,281 | **1.65 s** | **84x** | **Yes (100% Identical)** |
-| **ITK (CPU)** | 4,281 | 140.27 s | 1x | Baseline |
+| **Mode 0 (GPU Subgrid)** | 4,286 | **0.72 s** | **194x** | Topologically equivalent |
+| **Mode 1 (Hybrid CPU)** | 4,281 | 1.82 s | 77x | **Yes (100% Identical)** |
+| **ITK (CPU Baseline)** | 4,281 | 140.27 s | 1x | Baseline |
 
 To reproduce these benchmarks yourself:
 ```bash
 # Ensure you installed with dev dependencies: pip install -e ".[dev]"
 python examples/process_nifti.py
 ```
+*(The script will cache the slow ITK result to disk on the first run, so subsequent runs finish instantly).*

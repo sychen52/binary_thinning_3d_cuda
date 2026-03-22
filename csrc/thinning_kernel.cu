@@ -187,7 +187,7 @@ __global__ void mark_deletable_points_kernel(
     if (x >= w || y >= h || z >= d) return;
 
     size_t idx = (size_t)z * (h * w) + y * w + x;
-    if (img[idx] != 1) return;
+    if (img[idx] == 0 || img[idx] == 2) return;
 
     int neighbors[27];
     int num_neighbors = -1;
@@ -208,7 +208,6 @@ __global__ void mark_deletable_points_kernel(
                     val = img[flat_n_idx];
                 }
                 
-                // Both original foreground (1) and marked for deletion (2) are foreground
                 int binary_val = (val > 0) ? 1 : 0;
                 neighbors[n_idx] = binary_val;
                 
@@ -234,20 +233,6 @@ __global__ void mark_deletable_points_kernel(
     img[idx] = 2; // mark for deletion
 }
 
-__global__ void remove_marked_points_kernel(unsigned char* img, int d, int h, int w, int* changed) {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    int z = blockIdx.z * blockDim.z + threadIdx.z;
-
-    if (x >= w || y >= h || z >= d) return;
-
-    size_t idx = (size_t)z * (h * w) + y * w + x;
-    if (img[idx] == 2) {
-        img[idx] = 0;
-        atomicAdd(changed, 1);
-    }
-}
-
 struct is_marked {
     unsigned char* img;
     __host__ __device__
@@ -258,6 +243,48 @@ struct is_marked {
     }
 };
 
+__global__ void subgrid_recheck_kernel(unsigned char* img, int d, int h, int w, unsigned int* marked_indices, int count, int color, int* changed) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    
+    size_t idx = marked_indices[i];
+    if (img[idx] != 2) return; // Already handled by previous color or untouched
+    
+    int x = idx % w;
+    int y = (idx / w) % h;
+    int z = idx / (w * h);
+    
+    int p = (x % 2) + (y % 2) * 2 + (z % 2) * 4;
+    if (p != color) return;
+    
+    img[idx] = 0; // Temporarily delete
+    
+    int neighbors[27];
+    for (int dz = -1; dz <= 1; ++dz) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = x + dx;
+                int ny = y + dy;
+                int nz = z + dz;
+                int n_idx = (dz + 1) * 9 + (dy + 1) * 3 + (dx + 1);
+                
+                int val = 0;
+                if (nx >= 0 && nx < w && ny >= 0 && ny < h && nz >= 0 && nz < d) {
+                    size_t flat_n_idx = (size_t)nz * (h * w) + ny * w + nx;
+                    val = img[flat_n_idx];
+                }
+                neighbors[n_idx] = (val > 0) ? 1 : 0;
+            }
+        }
+    }
+    
+    if (!is_simple_point(neighbors)) {
+        img[idx] = 1; // Not simple anymore, restore
+    } else {
+        atomicAdd(changed, 1);
+    }
+}
+
 __global__ void apply_updates_kernel(unsigned char* img, unsigned int* indices, int count, unsigned char val) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) {
@@ -265,7 +292,7 @@ __global__ void apply_updates_kernel(unsigned char* img, unsigned int* indices, 
     }
 }
 
-void binary_thinning_cuda(torch::Tensor image, bool deterministic) {
+void binary_thinning_cuda(torch::Tensor image, int mode) {
     TORCH_CHECK(image.is_cuda(), "image must be a CUDA tensor");
     TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
     TORCH_CHECK(image.scalar_type() == torch::kByte, "image must be a ByteTensor (uint8)");
@@ -290,12 +317,10 @@ void binary_thinning_cuda(torch::Tensor image, bool deterministic) {
     cudaMalloc(&d_changed, sizeof(int));
 
     unsigned int* d_marked_indices = nullptr;
-    at::Tensor marked_indices_tensor;
     unsigned char* h_img = nullptr;
 
-    if (deterministic) {
-        marked_indices_tensor = at::empty({(long long)total_size}, image.options().dtype(torch::kInt));
-        d_marked_indices = (unsigned int*)marked_indices_tensor.data_ptr<int>();
+    cudaMalloc(&d_marked_indices, total_size * sizeof(unsigned int));
+    if (mode == 1) { // Mode 1: Exact ITK Hybrid
         h_img = new unsigned char[total_size];
         cudaMemcpy(h_img, d_img, total_size, cudaMemcpyDeviceToHost);
     }
@@ -313,15 +338,16 @@ void binary_thinning_cuda(torch::Tensor image, bool deterministic) {
             
             cudaMemset(d_changed, 0, sizeof(int));
             
-            if (deterministic) {
-                thrust::counting_iterator<size_t> first(0);
-                thrust::counting_iterator<size_t> last(total_size);
-                thrust::device_ptr<unsigned int> dest(d_marked_indices);
-                
-                auto end_ptr = thrust::copy_if(thrust::device, first, last, dest, is_marked(d_img));
-                int h_count = end_ptr - dest;
-                
-                if (h_count > 0) {
+            thrust::counting_iterator<size_t> first(0);
+            thrust::counting_iterator<size_t> last(total_size);
+            thrust::device_ptr<unsigned int> dest(d_marked_indices);
+            
+            auto end_ptr = thrust::copy_if(thrust::device, first, last, dest, is_marked(d_img));
+            int h_count = end_ptr - dest;
+            
+            if (h_count > 0) {
+                if (mode == 1) {
+                    // Mode 1: CPU Sequential (Exact ITK Match)
                     std::vector<unsigned int> h_marked(h_count);
                     cudaMemcpy(h_marked.data(), d_marked_indices, h_count * sizeof(unsigned int), cudaMemcpyDeviceToHost);
                     
@@ -380,17 +406,23 @@ void binary_thinning_cuda(torch::Tensor image, bool deterministic) {
                         int blocks = (h_restored.size() + threads - 1) / threads;
                         apply_updates_kernel<<<blocks, threads>>>(d_img, d_marked_indices, h_restored.size(), 1);
                     }
+                } else if (mode == 0) {
+                    // Mode 0: GPU Subgrid (8-color parallel) - Topologically safe, purely GPU
+                    int threads = 256;
+                    int blocks = (h_count + threads - 1) / threads;
+                    for (int color = 0; color < 8; ++color) {
+                        subgrid_recheck_kernel<<<blocks, threads>>>(d_img, d, h, w, d_marked_indices, h_count, color, d_changed);
+                    }
+                    int changed_this_border = 0;
+                    cudaMemcpy(&changed_this_border, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
+                    h_changed += changed_this_border;
                 }
-            } else {
-                remove_marked_points_kernel<<<gridSize, blockSize>>>(d_img, d, h, w, d_changed);
-                int changed_this_border = 0;
-                cudaMemcpy(&changed_this_border, d_changed, sizeof(int), cudaMemcpyDeviceToHost);
-                h_changed += changed_this_border;
             }
         }
     } while (h_changed > 0);
 
-    if (deterministic) {
+    cudaFree(d_marked_indices);
+    if (mode == 1) {
         delete[] h_img;
     }
     cudaFree(d_changed);
