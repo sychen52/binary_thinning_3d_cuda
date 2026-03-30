@@ -15,8 +15,8 @@ def process_nifti(input_path, num_runs=5):
     print(f"Original shape: {img_array.shape}, type: {img_array.dtype}")
     print(f"Original sum (volume): {np.sum(img_array > 0)}")
 
-    # Prepare base tensor on GPU
-    base_tensor = torch.from_numpy(img_array > 0).to(torch.uint8).cuda()
+    # Keep a base CPU tensor for repeatable benchmarking
+    base_tensor_cpu = torch.from_numpy(img_array > 0).to(torch.uint8)
 
     # 0. GPU Subgrid (8-color)
     print(
@@ -26,7 +26,7 @@ def process_nifti(input_path, num_runs=5):
     cuda_binary_array_subgrid = None
 
     for i in range(num_runs):
-        tensor_subgrid = base_tensor.clone()
+        tensor_subgrid = base_tensor_cpu.clone()  # Start with a CPU tensor
         torch.cuda.synchronize()
         start_time = time.time()
         binary_thinning(tensor_subgrid, mode=0)
@@ -35,12 +35,12 @@ def process_nifti(input_path, num_runs=5):
         times_subgrid.append(elapsed)
         print(f"  Run {i+1}/{num_runs}: {elapsed:.4f}s")
         if i == num_runs - 1:
-            cuda_binary_array_subgrid = (tensor_subgrid.cpu().numpy() > 0).astype(
-                np.uint8
-            )
+            cuda_binary_array_subgrid = (tensor_subgrid.numpy() > 0).astype(np.uint8)
 
     cuda_time_subgrid = np.median(times_subgrid)
-    print(f"Median CUDA GPU Subgrid Thinning: {cuda_time_subgrid:.4f} seconds.")
+    print(
+        f"Median CUDA GPU Subgrid Thinning (including CPU<->GPU copies): {cuda_time_subgrid:.4f} seconds."
+    )
 
     # 1. GPU Hybrid (CPU Sync)
     print(
@@ -50,7 +50,7 @@ def process_nifti(input_path, num_runs=5):
     cuda_binary_array_cpu_sync = None
 
     for i in range(num_runs):
-        tensor_cpu_sync = base_tensor.clone()
+        tensor_cpu_sync = base_tensor_cpu.clone()  # Start with a CPU tensor
         torch.cuda.synchronize()
         start_time = time.time()
         binary_thinning(tensor_cpu_sync, mode=1)
@@ -59,12 +59,12 @@ def process_nifti(input_path, num_runs=5):
         times_cpu_sync.append(elapsed)
         print(f"  Run {i+1}/{num_runs}: {elapsed:.4f}s")
         if i == num_runs - 1:
-            cuda_binary_array_cpu_sync = (tensor_cpu_sync.cpu().numpy() > 0).astype(
-                np.uint8
-            )
+            cuda_binary_array_cpu_sync = (tensor_cpu_sync.numpy() > 0).astype(np.uint8)
 
     cuda_time_cpu_sync = np.median(times_cpu_sync)
-    print(f"Median CUDA Hybrid CPU-Sync Thinning: {cuda_time_cpu_sync:.4f} seconds.")
+    print(
+        f"Median CUDA Hybrid CPU-Sync Thinning (including CPU<->GPU copies): {cuda_time_cpu_sync:.4f} seconds."
+    )
 
     # 2. CPU (ITK)
     print("\n--- 2. Starting ITK thinning (CPU) ---")
@@ -113,7 +113,7 @@ def process_nifti(input_path, num_runs=5):
     if itk_binary_array is not None:
         print(f"ITK CPU sum                      : {np.sum(itk_binary_array)}")
 
-    print("\n--- Timing (Median of GPU runs) ---")
+    print("\n--- Timing (including copies) ---")
     print(f"Mode 0 (GPU Subgrid)             : {cuda_time_subgrid:.4f} s")
     print(f"Mode 1 (Hybrid CPU)              : {cuda_time_cpu_sync:.4f} s")
     if itk_binary_array is not None:

@@ -4,8 +4,9 @@ from . import cuda_thinning_ext
 
 def binary_thinning(tensor: torch.Tensor, mode: int = 0) -> torch.Tensor:
     """
-    3D binary thinning using CUDA. If the tensor is on CUDA, the operation is performed in-place.
-    If it's on CPU, it will be moved to CUDA for processing and then copied back.
+    3D binary thinning using CUDA.
+    The operation is performed on the tensor provided (in-place for the binary representation).
+    If the tensor is on CPU, it will be moved to CUDA for processing and then copied back to the original tensor.
 
     Args:
         tensor (torch.Tensor): A 3D tensor. All non-zero values are treated as foreground.
@@ -21,21 +22,22 @@ def binary_thinning(tensor: torch.Tensor, mode: int = 0) -> torch.Tensor:
     if mode not in [0, 1]:
         raise ValueError("Mode must be 0 (GPU Subgrid) or 1 (CPU Sequential).")
 
-    # We must operate on a contiguous ByteTensor (uint8)
-    if not tensor.is_cuda:
-        work_tensor = tensor.to(device="cuda", dtype=torch.uint8)
-    elif tensor.dtype != torch.uint8 or not tensor.is_contiguous():
+    # Ensure it's uint8 and contiguous before passing to CUDA extension
+    # We do this check here to keep the C++ extension focused on the algorithm
+    if tensor.dtype != torch.uint8 or not tensor.is_contiguous():
+        # This creates a new tensor, we won't be able to modify the original in-place
+        # if the user passed something like a float tensor or a non-contiguous one.
         work_tensor = (tensor != 0).to(torch.uint8).contiguous()
+        cuda_thinning_ext.binary_thinning(work_tensor, mode)
+        # If the original was on the same device, we can try to copy back
+        if tensor.shape == work_tensor.shape:
+            try:
+                tensor.copy_(work_tensor)
+            except Exception:
+                pass  # Might fail if types are incompatible for copy_
+        return work_tensor
     else:
-        work_tensor = tensor
-        tensor[tensor != 0] = 1  # Ensure binary
-
-    cuda_thinning_ext.binary_thinning(work_tensor, mode)
-
-    if not tensor.is_cuda:
-        return work_tensor.cpu()
-
-    if work_tensor is not tensor:
-        tensor.copy_(work_tensor)
-
-    return tensor
+        # In-place ensure binary (0 or 1)
+        tensor.clamp_(0, 1)
+        cuda_thinning_ext.binary_thinning(tensor, mode)
+        return tensor

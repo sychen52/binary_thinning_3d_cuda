@@ -355,7 +355,6 @@ __global__ void apply_updates_kernel(unsigned char *img,
 }
 
 void binary_thinning_cuda(torch::Tensor image, int mode) {
-  TORCH_CHECK(image.is_cuda(), "image must be a CUDA tensor");
   TORCH_CHECK(image.is_contiguous(), "image must be contiguous");
   TORCH_CHECK(image.scalar_type() == torch::kByte,
               "image must be a ByteTensor (uint8)");
@@ -366,7 +365,14 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
   int w = image.size(2);
   size_t total_size = (size_t)d * h * w;
 
-  unsigned char *d_img = image.data_ptr<unsigned char>();
+  bool is_cpu = !image.is_cuda();
+  torch::Tensor d_tensor;
+  if (is_cpu) {
+    d_tensor = image.to(torch::kCUDA);
+  } else {
+    d_tensor = image;
+  }
+  unsigned char *d_img = d_tensor.data_ptr<unsigned char>();
 
   int *d_changed;
   cudaMalloc(&d_changed, sizeof(int));
@@ -379,8 +385,12 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
 
   cudaMalloc(&d_marked_indices, total_size * sizeof(unsigned int));
   if (mode == 1) { // Mode 1: Exact ITK Hybrid
-    h_img = new unsigned char[total_size];
-    cudaMemcpy(h_img, d_img, total_size, cudaMemcpyDeviceToHost);
+    if (is_cpu) {
+      h_img = image.data_ptr<unsigned char>();
+    } else {
+      h_img = new unsigned char[total_size];
+      cudaMemcpy(h_img, d_img, total_size, cudaMemcpyDeviceToHost);
+    }
     cudaMalloc(&d_new_values, total_size * sizeof(unsigned char));
   }
 
@@ -467,9 +477,15 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
     }
   } while (h_changed > 0);
 
+  if (is_cpu) {
+    image.copy_(d_tensor);
+  }
+
   cudaFree(d_marked_indices);
   if (mode == 1) {
-    delete[] h_img;
+    if (!is_cpu) {
+      delete[] h_img;
+    }
     cudaFree(d_new_values);
   }
   cudaFree(d_changed);
