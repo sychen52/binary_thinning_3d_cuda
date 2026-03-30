@@ -12,12 +12,11 @@
  * resolves these candidates either sequentially (Mode 1) or in parallel
  * subgrids (Mode 2) to ensure topological correctness.
  */
+#include <algorithm>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <thrust/copy.h>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
-#include <thrust/iterator/counting_iterator.h>
 #include <torch/extension.h>
 #include <vector>
 
@@ -263,7 +262,9 @@ __host__ __device__ bool is_simple_point(const int *neighbors) {
 }
 
 __global__ void mark_deletable_points_kernel(unsigned char *img, int d, int h,
-                                             int w, int currentBorder) {
+                                             int w, int currentBorder,
+                                             unsigned int *marked_indices,
+                                             int *marked_count) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   int z = blockIdx.z * blockDim.z + threadIdx.z;
@@ -309,13 +310,9 @@ __global__ void mark_deletable_points_kernel(unsigned char *img, int d, int h,
     return;
 
   img[idx] = 2; // mark for deletion
+  int pos = atomicAdd(marked_count, 1);
+  marked_indices[pos] = (unsigned int)idx;
 }
-
-struct is_marked {
-  unsigned char *img;
-  __host__ __device__ is_marked(unsigned char *_img) : img(_img) {}
-  __device__ bool operator()(const size_t &idx) const { return img[idx] == 2; }
-};
 
 __global__ void subgrid_recheck_kernel(unsigned char *img, int d, int h, int w,
                                        unsigned int *marked_indices, int count,
@@ -373,6 +370,8 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
 
   int *d_changed;
   cudaMalloc(&d_changed, sizeof(int));
+  int *d_marked_count;
+  cudaMalloc(&d_marked_count, sizeof(int));
 
   unsigned int *d_marked_indices = nullptr;
   unsigned char *d_new_values = nullptr;
@@ -397,16 +396,12 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
       cudaMemset(d_changed, 0, sizeof(int));
     }
     for (int border = 1; border <= 6; ++border) {
-      mark_deletable_points_kernel<<<gridSize, blockSize>>>(d_img, d, h, w,
-                                                            border);
+      cudaMemset(d_marked_count, 0, sizeof(int));
+      mark_deletable_points_kernel<<<gridSize, blockSize>>>(
+          d_img, d, h, w, border, d_marked_indices, d_marked_count);
 
-      thrust::counting_iterator<size_t> first(0);
-      thrust::counting_iterator<size_t> last(total_size);
-      thrust::device_ptr<unsigned int> dest(d_marked_indices);
-
-      auto end_ptr =
-          thrust::copy_if(thrust::device, first, last, dest, is_marked(d_img));
-      int h_count = end_ptr - dest;
+      int h_count = 0;
+      cudaMemcpy(&h_count, d_marked_count, sizeof(int), cudaMemcpyDeviceToHost);
 
       if (h_count > 0) {
         if (mode == 1) {
@@ -414,6 +409,10 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
           std::vector<unsigned int> h_marked(h_count);
           cudaMemcpy(h_marked.data(), d_marked_indices,
                      h_count * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+          // Sort indices on CPU to maintain ITK's specific processing order
+          // (lexicographical)
+          std::sort(h_marked.begin(), h_marked.end());
 
           std::vector<unsigned char> h_new_values(h_count);
 
@@ -440,6 +439,11 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
 
           cudaMemcpy(d_new_values, h_new_values.data(),
                      h_count * sizeof(unsigned char), cudaMemcpyHostToDevice);
+
+          // Also need to copy the sorted indices back for apply_updates_kernel
+          cudaMemcpy(d_marked_indices, h_marked.data(),
+                     h_count * sizeof(unsigned int), cudaMemcpyHostToDevice);
+
           int threads = 256;
           int blocks = (h_count + threads - 1) / threads;
           apply_updates_kernel<<<blocks, threads>>>(d_img, d_marked_indices,
@@ -469,4 +473,5 @@ void binary_thinning_cuda(torch::Tensor image, int mode) {
     cudaFree(d_new_values);
   }
   cudaFree(d_changed);
+  cudaFree(d_marked_count);
 }
