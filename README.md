@@ -73,6 +73,10 @@ binary_thinning(tensor, mode=1)
 
 The following benchmark was run on a `(767, 512, 512)` NIfTI volume (CT Airways Label) containing `451,530` foreground voxels. 
 
+**Hardware:**
+- **CPU:** AMD Ryzen 7 2700 Eight-Core Processor
+- **GPU:** NVIDIA GeForce RTX 2070
+
 The benchmark compares this CUDA implementation against `itk.BinaryThinningImageFilter3D` (which is run sequentially on the CPU). The CUDA timings **include** the time for CPU-to-GPU and GPU-to-CPU data transfers.
 
 | Method | Output Voxel Count | Time (Seconds) | Speedup vs ITK | Matches ITK CPU? |
